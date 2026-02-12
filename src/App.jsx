@@ -23,6 +23,35 @@ import {
   Sunset
 } from 'lucide-react';
 
+// Storage Imports
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, doc, onSnapshot, setDoc, deleteDoc } from 'firebase/firestore';
+
+// --- CLOUD STORAGE SETUP ---
+const getFirebaseConfig = () => {
+  try {
+    return typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+  } catch (e) {
+    return null;
+  }
+};
+
+const firebaseConfig = getFirebaseConfig();
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+let firebaseApp, auth, db;
+
+if (firebaseConfig) {
+  try {
+    firebaseApp = initializeApp(firebaseConfig);
+    auth = getAuth(firebaseApp);
+    db = getFirestore(firebaseApp);
+  } catch (e) {
+    console.error("Firebase initialization failed:", e);
+  }
+}
+
 // B&Q Logo Component
 const BnQLogo = () => (
   <svg 
@@ -64,10 +93,10 @@ const WEATHER_CODES = {
 const BACKGROUND_IMAGES = {
   clear_day: "https://images.unsplash.com/photo-1502082553048-f009c37129b9?auto=format&fit=crop&q=80&w=2560", 
   clear_night: "https://images.unsplash.com/photo-1502134249126-9f3755a50d78?auto=format&fit=crop&q=80&w=2560", 
-  cloudy_day: "https://images.unsplash.com/photo-1483728642387-6c3bdd6c93e5?auto=format&fit=crop&q=80&w=2560", 
+  cloudy_day: "https://images.unsplash.com/photo-1449824913935-59a10b8d2000?auto=format&fit=crop&q=80&w=2560", 
   cloudy_night: "https://images.unsplash.com/photo-1494548162494-384bba4ab999?auto=format&fit=crop&q=80&w=2560", 
   rainy_day: "https://images.unsplash.com/photo-1511497584788-876760111969?auto=format&fit=crop&q=80&w=2560", 
-  rainy_night: "https://images.unsplash.com/photo-1508873535684-277a3cbcc4e8?auto=format&fit=crop&q=80&w=2560", 
+  rainy_night: "https://images.unsplash.com/photo-1515694346937-94d85e41e6f0?auto=format&fit=crop&q=80&w=2560", 
   snowy_day: "https://images.unsplash.com/photo-1483921020237-2ff51e8e4b22?auto=format&fit=crop&q=80&w=2560", 
   snowy_night: "https://images.unsplash.com/photo-1478720568477-151d9b16ef1e?auto=format&fit=crop&q=80&w=2560", 
   stormy_day: "https://images.unsplash.com/photo-1534088568595-a066f710b721?auto=format&fit=crop&q=80&w=2560", 
@@ -78,13 +107,10 @@ const BACKGROUND_IMAGES = {
 const getWeatherInfo = (code) => WEATHER_CODES[code] || { label: 'Unknown', icon: Cloud, nightIcon: Cloud, color: 'text-slate-400', category: 'default' };
 
 const App = () => {
-  const [locations, setLocations] = useState([
-    { id: '1', name: 'New York', lat: 40.7128, lon: -74.0060, member: 'Alex', country: 'US' },
-    { id: '2', name: 'London', lat: 51.5074, lon: -0.1278, member: 'Sarah', country: 'GB' },
-    { id: '3', name: 'Tokyo', lat: 35.6762, lon: 139.6503, member: 'Kenji', country: 'JP' }
-  ]);
+  const [user, setUser] = useState(null);
+  const [locations, setLocations] = useState([]);
   const [weatherData, setWeatherData] = useState({});
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
   const [isSearching, setIsSearching] = useState(false);
@@ -95,16 +121,79 @@ const App = () => {
   
   const searchTimeout = useRef(null);
 
+  // 1. Initial Authentication
   useEffect(() => {
-    if (Object.keys(weatherData).length === 0 || Object.keys(weatherData).length < locations.length) return;
+    if (!auth) {
+      setLoading(false);
+      return;
+    }
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (e) {
+        console.warn("Auth failed, continuing in offline mode.");
+        setLoading(false);
+      }
+    };
+    initAuth();
+    return onAuthStateChanged(auth, setUser);
+  }, []);
 
-    const locationStyles = Object.values(weatherData).map(data => {
+  // 2. Real-time Cloud Sync with Auto-Seeding
+  useEffect(() => {
+    if (!user || !db) {
+      setLoading(false);
+      return;
+    }
+
+    const locationsCol = collection(db, 'artifacts', appId, 'public', 'data', 'locations');
+    
+    const unsubscribe = onSnapshot(locationsCol, (snapshot) => {
+      const locs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      
+      // If the cloud is totally empty, seed with the B&Q defaults automatically
+      if (locs.length === 0 && loading) {
+        const defaults = [
+          { name: 'London', lat: 51.5074, lon: -0.1278, member: 'Sarah', country: 'GB', admin: 'England' },
+          { name: 'New York', lat: 40.7128, lon: -74.0060, member: 'Alex', country: 'US', admin: 'NY' },
+          { name: 'Tokyo', lat: 35.6762, lon: 139.6503, member: 'Kenji', country: 'JP', admin: 'Tokyo' }
+        ];
+        defaults.forEach(d => {
+          const newId = Math.random().toString(36).substring(7);
+          setDoc(doc(locationsCol, newId), d);
+        });
+      } else {
+        setLocations(locs);
+        setLoading(false);
+      }
+    }, (err) => {
+      console.warn("Storage sync failed.");
+      setLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, [user, loading]);
+
+  // 3. Dynamic Background Logic (Majority Rules)
+  useEffect(() => {
+    if (locations.length === 0) return;
+
+    // Filter weather data for only the locations currently in our list
+    const styles = locations.map(loc => {
+      const data = weatherData[loc.id];
+      if (!data) return null;
       const info = getWeatherInfo(data.current.weather_code);
       const suffix = data.current.is_day ? 'day' : 'night';
       return `${info.category}_${suffix}`;
-    });
+    }).filter(Boolean);
 
-    const counts = locationStyles.reduce((acc, style) => {
+    if (styles.length === 0) return;
+
+    const counts = styles.reduce((acc, style) => {
       acc[style] = (acc[style] || 0) + 1;
       return acc;
     }, {});
@@ -112,8 +201,9 @@ const App = () => {
     const dominantStyle = Object.keys(counts).reduce((a, b) => counts[a] >= counts[b] ? a : b);
     setConsensusBg(BACKGROUND_IMAGES[dominantStyle] || BACKGROUND_IMAGES.default);
     setGlobalVibe(dominantStyle.replace('_', ' '));
-  }, [weatherData, locations.length]);
+  }, [weatherData, locations]);
 
+  // 4. Geocoding Search
   useEffect(() => {
     if (searchQuery.length < 2) {
       setSearchResults([]);
@@ -140,8 +230,9 @@ const App = () => {
     return () => clearTimeout(searchTimeout.current);
   }, [searchQuery]);
 
+  // 5. Weather Data Fetcher
   const fetchWeather = useCallback(async () => {
-    setLoading(true);
+    if (locations.length === 0) return;
     const newData = {};
     
     try {
@@ -154,9 +245,7 @@ const App = () => {
       }));
       setWeatherData(newData);
     } catch (err) {
-      setError("Failed to fetch weather data. Please check your connection.");
-    } finally {
-      setLoading(false);
+      console.error("Weather error:", err);
     }
   }, [locations]);
 
@@ -166,31 +255,50 @@ const App = () => {
     return () => clearInterval(interval);
   }, [fetchWeather]);
 
-  const addLocation = (result) => {
+  // 6. Action Handlers
+  const addLocation = async (result) => {
+    const id = Date.now().toString();
     const newLoc = {
-      id: Date.now().toString(),
-      name: result.name,
+      name: result.name || 'Unknown',
       lat: result.latitude,
       lon: result.longitude,
       member: 'New Member',
-      country: result.country_code,
-      admin: result.admin1
+      country: result.country_code || '',
+      admin: result.admin1 || '' 
     };
-    setLocations([...locations, newLoc]);
+
+    if (db && user) {
+      try {
+        const locationsCol = collection(db, 'artifacts', appId, 'public', 'data', 'locations');
+        await setDoc(doc(locationsCol, id), newLoc);
+      } catch (err) {
+        console.error("Firestore error:", err);
+        setError("Could not save new member.");
+      }
+    } else {
+      setLocations([...locations, { id, ...newLoc }]);
+    }
+    
     setSearchQuery('');
     setSearchResults([]);
   };
 
-  const removeLocation = (id) => {
-    const updated = locations.filter(l => l.id !== id);
-    setLocations(updated);
-    const newWeatherData = { ...weatherData };
-    delete newWeatherData[id];
-    setWeatherData(newWeatherData);
+  const removeLocation = async (id) => {
+    if (db && user) {
+      const locDoc = doc(db, 'artifacts', appId, 'public', 'data', 'locations', id);
+      await deleteDoc(locDoc);
+    } else {
+      setLocations(locations.filter(l => l.id !== id));
+    }
   };
 
-  const updateMemberName = (id, name) => {
-    setLocations(locations.map(l => l.id === id ? { ...l, member: name } : l));
+  const updateMemberName = async (id, name) => {
+    if (db && user) {
+      const locDoc = doc(db, 'artifacts', appId, 'public', 'data', 'locations', id);
+      await setDoc(locDoc, { member: name || 'New Member' }, { merge: true });
+    } else {
+      setLocations(locations.map(l => l.id === id ? { ...l, member: name } : l));
+    }
   };
 
   const convertTemp = (temp) => {
@@ -199,7 +307,7 @@ const App = () => {
   };
 
   return (
-    <div className="relative min-h-screen text-emerald-50 font-sans selection:bg-emerald-800 transition-all duration-1000 overflow-x-hidden">
+    <div className="relative min-h-screen text-emerald-50 font-sans transition-all duration-1000 overflow-x-hidden">
       {/* Dynamic Earthy Background Layer */}
       <div 
         className="fixed inset-0 z-0 transition-all duration-1000 ease-in-out scale-105"
@@ -222,7 +330,7 @@ const App = () => {
               </h1>
               <p className="text-emerald-200 mt-1 font-bold flex items-center gap-2">
                 <Leaf className="w-4 h-4 text-emerald-400" />
-                B&Q Team Geographical Overview
+                B&Q Team Geographical Overview {!db && "(Offline Mode)"}
               </p>
             </div>
           </div>
@@ -277,8 +385,8 @@ const App = () => {
                     <div className="flex-1 min-w-0 mr-2">
                       <input 
                         type="text" 
-                        value={loc.member}
-                        onChange={(e) => updateMemberName(loc.id, e.target.value)}
+                        defaultValue={loc.member}
+                        onBlur={(e) => updateMemberName(loc.id, e.target.value)}
                         className="bg-transparent border-none p-0 font-bold text-xl text-emerald-300 hover:bg-white/10 focus:bg-white/20 focus:ring-0 rounded-lg px-2 -ml-2 w-full transition-all truncate"
                       />
                       <div className="flex items-center text-emerald-100/80 text-xs font-black truncate mt-1 uppercase tracking-[0.15em]">
@@ -359,7 +467,7 @@ const App = () => {
             );
           })}
 
-          {/* Add Location Card (Integrated Search) */}
+          {/* Add Location Card (Integrated Search Tile) */}
           <div className="bg-emerald-950/40 backdrop-blur-md border-2 border-dashed border-white/20 rounded-[2.5rem] flex flex-col p-6 min-h-[400px] transition-all group hover:border-emerald-400/50 overflow-hidden">
             <div className="flex items-center gap-3 mb-4">
               <div className="p-2 bg-white/10 rounded-xl">
