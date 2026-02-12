@@ -1,0 +1,8 @@
+@import "tailwindcss";
+
+/* This ensures the background image transitions are smooth for your neurodivergent-friendly UI */
+.transition-all {
+  transition-property: all;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  transition-duration: 1000ms;
+}
